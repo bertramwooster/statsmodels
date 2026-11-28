@@ -1196,8 +1196,6 @@ CONVOLUTION_2D_CASES = [
     for kind in ("1d", "column", "2d")
     for nlags in (1, 2, 3, 4)
     for nsides in (1, 2)
-    # a (1, nvar) filter is not a separate lag polynomial per column
-    if not (kind == "2d" and nlags == 1)
 ]
 
 
@@ -2163,3 +2161,322 @@ def test_fftconvolveinv_longer_in2(mode, start, stop):
     in2 = array([1.0, -a, 0.0, 0.0, 0.0])
     res = fftconvolveinv(in1, in2, mode=mode)
     assert_allclose(res, geometric[start:stop], rtol=1e-12)
+
+
+def _fft_input_form(value, form):
+    if form == "list":
+        return value.tolist()
+    elif form == "tuple":
+        return tuple(value)
+    elif form == "series":
+        return Series(value, index=date_range("2000-01-01", periods=value.shape[0]))
+    # integers as a list
+    return np.round(10 * value).astype(int).tolist()
+
+
+FFT_FORMS = ["list", "tuple", "series", "int-list"]
+
+
+@pytest.mark.parametrize("form", FFT_FORMS)
+@pytest.mark.parametrize("arg", ["in1", "in2"])
+def test_fftconvolveinv_array_like(arg, form):
+    # a list, tuple or Series raised an AttributeError or a KeyError. The
+    # inverse filter is the recursion of lfilter: the FFT wraps around after
+    # 256 values, which changes the first 200 by less than 0.5 ** 56.
+    from scipy import signal
+
+    x = np.random.default_rng(20261121).standard_normal(200)
+    args = {"in1": x, "in2": np.array([1.0, 0.5, 0.25])}
+    args[arg] = _fft_input_form(args[arg], form)
+    expected = signal.lfilter([1.0], np.asarray(args["in2"], float), args["in1"])
+    res = fftconvolveinv(args["in1"], args["in2"], mode="full")
+    assert isinstance(res, np.ndarray)
+    assert res.shape == (202,)
+    # atol for values near zero: the FFT rounding error is absolute
+    assert_allclose(res[:200], expected, rtol=1e-10, atol=1e-12)
+
+
+@pytest.mark.parametrize("form", FFT_FORMS)
+@pytest.mark.parametrize("arg", ["in1", "in2", "in3"])
+def test_fftconvolve3_array_like(arg, form):
+    # a list, tuple or Series raised an AttributeError or a KeyError.
+    # fftconvolve3(x, ma, ar) is the ARMA filter of lfilter, up to the FFT
+    # wrap-around after 256 values (below 0.5 ** 56 for the first 200).
+    from scipy import signal
+
+    x = np.random.default_rng(20261121).standard_normal(200)
+    args = {"in1": x, "in2": np.array([1.0, 0.4]), "in3": np.array([1.0, -0.5])}
+    args[arg] = _fft_input_form(args[arg], form)
+    in1, in2, in3 = (args[key] for key in ("in1", "in2", "in3"))
+    expected = signal.lfilter(np.asarray(in2, float), np.asarray(in3, float), in1)
+    res = fftconvolve3(in1, in2, in3, mode="full")
+    assert isinstance(res, np.ndarray)
+    assert res.shape == (201,)
+    # atol for values near zero: the FFT rounding error is absolute
+    assert_allclose(res[:200], expected, rtol=1e-10, atol=1e-12)
+
+
+def test_fftconvolve_dataframe():
+    # a DataFrame raised an AttributeError. It is 2-d, so it is filtered
+    # with 2-d filters, along its rows.
+    from scipy import signal
+
+    x = np.random.default_rng(20261121).standard_normal(200)
+    df = DataFrame({"x": x}, index=date_range("2000-01-01", periods=200))
+    ma, ar = np.array([1.0, 0.4]), np.array([1.0, -0.5])
+    res = fftconvolveinv(df, ar[:, None], mode="full")
+    assert res.shape == (201, 1)
+    # atol for values near zero: the FFT rounding error is absolute
+    expected = signal.lfilter([1.0], ar, x)
+    assert_allclose(res[:200, 0], expected, rtol=1e-10, atol=1e-12)
+    # without in3, the convolution with in2
+    res = fftconvolve3(df, DataFrame(ma), mode="full")
+    assert res.shape == (201, 1)
+    assert_allclose(res[:, 0], np.convolve(x, ma), rtol=1e-10, atol=1e-12)
+
+
+@pytest.mark.parametrize("complex_arg", ["in1", "in2", "in1-in3"])
+def test_fftconvolve_complex_list(complex_arg):
+    # complex lists stay complex, and the result is the complex filter of
+    # lfilter
+    from scipy import signal
+
+    rng = np.random.default_rng(20261121)
+    x = rng.standard_normal(200)
+    ma, ar = np.array([1.0, 0.4]), np.array([1.0, -0.5])
+    if "in1" in complex_arg:
+        x = x + 1j * rng.standard_normal(200)
+    if complex_arg == "in2":
+        ma, ar = np.array([1.0, 0.4j]), np.array([1.0, -0.5j])
+    elif complex_arg == "in1-in3":
+        ar = np.array([1.0, -0.5j])
+    # fftconvolveinv has no third input, so it uses ar as in2
+    res = fftconvolveinv(x.tolist(), ar.tolist(), mode="full")
+    assert np.iscomplexobj(res)
+    # atol for values near zero: the FFT rounding error is absolute
+    expected = signal.lfilter([1.0], ar, x)
+    assert_allclose(res[:200], expected, rtol=1e-10, atol=1e-12)
+    res = fftconvolve3(x.tolist(), ma.tolist(), ar.tolist(), mode="full")
+    assert np.iscomplexobj(res)
+    expected = signal.lfilter(ma, ar, x)
+    assert_allclose(res[:200], expected, rtol=1e-10, atol=1e-12)
+
+
+@pytest.mark.parametrize("mode", ["full", "same", "valid"])
+def test_fftconvolve3_in3_without_in2(mode):
+    # in3 without in2 raised an AttributeError. It filters in1 with the
+    # inverse of in3. With in1 = [1, 0] and in3 = 1 - a L padded to 5 values,
+    # the FFT has 8 points, and the circular inverse of 1 - a L is
+    # a ** k / (1 - a ** 8), k = 0, ..., 7. "full" is the first
+    # 2 + 5 - 1 = 6 values, "same" the centered 5 and "valid" the centered
+    # 5 - 2 + 1 = 4.
+    a = 0.6
+    geo = a ** np.arange(8) / (1 - a**8)
+    expected = {"full": geo[:6], "same": geo[:5], "valid": geo[1:5]}[mode]
+    in3 = np.array([1.0, -a, 0.0, 0.0, 0.0])
+    res = fftconvolve3(np.array([1.0, 0.0]), in3=in3, mode=mode)
+    assert_allclose(res, expected, rtol=1e-12)
+
+
+@pytest.mark.parametrize("mode", ["full", "same", "valid"])
+@pytest.mark.parametrize("is_complex", [False, True])
+def test_fftconvolve3_in3_without_in2_matches_lfilter(mode, is_complex):
+    # the inverse filter is the recursion of lfilter, up to the FFT
+    # wrap-around after 256 values (below 0.5 ** 56 for the first 200).
+    # "same" is the first 200 of the 201 values and "valid" the 199 after
+    # the first.
+    from scipy import signal
+
+    rng = np.random.default_rng(20261121)
+    x = rng.standard_normal(200)
+    if is_complex:
+        x = x + 1j * rng.standard_normal(200)
+    ar = np.array([1.0, -0.5])
+    expected = signal.lfilter([1.0], ar, x)
+    expected = {"full": expected, "same": expected, "valid": expected[1:]}[mode]
+    res = fftconvolve3(x, in3=ar, mode=mode)
+    assert np.iscomplexobj(res) is is_complex
+    assert res.shape == {"full": (201,), "same": (200,), "valid": (199,)}[mode]
+    # atol for values near zero: the FFT rounding error is absolute
+    assert_allclose(res[: expected.shape[0]], expected, rtol=1e-10, atol=1e-12)
+
+
+@pytest.mark.parametrize("mode", ["bogus", "FULL", None])
+@pytest.mark.parametrize("func", [fftconvolveinv, fftconvolve3])
+def test_fftconvolve_invalid_mode_deprecated(func, mode):
+    # an invalid mode silently returned None. It still does, with a warning
+    # that points at the caller.
+    x = np.random.default_rng(20261121).standard_normal(20)
+    with pytest.warns(FutureWarning, match="mode must be 'full', 'same' or") as rec:
+        res = func(x, np.array([1.0, -0.5]), mode=mode)
+    assert res is None
+    assert rec[0].filename == __file__
+
+
+@pytest.mark.parametrize(
+    "useic",
+    [[1.0], [1.5, -2.0], np.array([2.0])],
+    ids=["list", "list-2", "ndarray"],
+)
+def test_miso_lfilter_nonzero_useic_without_ar_lags(useic):
+    # without AR lags there are no initial conditions. A non-zero useic
+    # raised "Unexpected shape for parameter zi" because lfiltic was called
+    # with b = [1, 0]. It is ignored, as values beyond len(ar) - 1 are, and
+    # the result is the combined input.
+    _, ma, x = _miso_lfilter_data()
+    y, inp = miso_lfilter(array([1.0]), ma, x, useic=useic)
+    expected_y, expected_inp = _miso_lfilter_recursion(array([1.0]), ma, x)
+    assert_allclose(inp, expected_inp, rtol=1e-12)
+    assert_allclose(y, expected_y, rtol=1e-12)
+
+
+@pytest.mark.parametrize("nlags", [1, 2, 3])
+def test_miso_lfilter_useic_extra_values_ignored(nlags):
+    # useic values beyond len(ar) - 1 are ignored: y[-1], ..., y[-nlags] are
+    # the first nlags values
+    _, ma, x = _miso_lfilter_data()
+    ar = array([1.0, -0.5, 0.2, 0.1])[: nlags + 1]
+    useic = [1.5, -2.0, 0.5, 3.0]
+    y, inp = miso_lfilter(ar, ma, x, useic=useic)
+    expected_y, expected_inp = _miso_lfilter_recursion(ar, ma, x, useic[:nlags])
+    assert_allclose(inp, expected_inp, rtol=1e-12)
+    assert_allclose(y, expected_y, rtol=1e-10)
+
+
+@pytest.mark.parametrize("nlags", [0, 1, 2])
+@pytest.mark.parametrize("form", ["float", "int", "numpy-float", "ndarray-0d"])
+def test_miso_lfilter_scalar_useic(form, nlags):
+    # a scalar useic raised an IndexError for one AR lag, and a ValueError
+    # for two or more with scipy >= 1.16. It is y[-1], with zero for the
+    # further lags, as lfiltic of scipy < 1.16 treated it for two or more.
+    _, ma, x = _miso_lfilter_data()
+    ar = array([1.0, -0.5, 0.2])[: nlags + 1]
+    useic = {
+        "float": 1.5,
+        "int": 2,
+        "numpy-float": np.float64(1.5),
+        "ndarray-0d": np.array(1.5),
+    }[form]
+    y, inp = miso_lfilter(ar, ma, x, useic=useic)
+    past = [float(useic)] + [0.0] * (nlags - 1) if nlags else None
+    expected_y, expected_inp = _miso_lfilter_recursion(ar, ma, x, past)
+    assert_allclose(inp, expected_inp, rtol=1e-12)
+    assert_allclose(y, expected_y, rtol=1e-10)
+
+
+@pytest.mark.parametrize("useic", [True, np.True_], ids=["bool", "numpy-bool"])
+@pytest.mark.parametrize("nlags", [0, 1])
+def test_miso_lfilter_useic_true_raises(nlags, useic):
+    # useic=True is not a set of initial values. With no or one AR lag it
+    # raised an error from scipy (zi shape, IndexError)
+    _, ma, x = _miso_lfilter_data()
+    ar = array([1.0, -0.5])[: nlags + 1]
+    with pytest.raises(ValueError, match="useic must be False or the initial"):
+        miso_lfilter(ar, ma, x, useic=useic)
+
+
+@pytest.mark.parametrize("useic", [True, np.True_], ids=["bool", "numpy-bool"])
+@pytest.mark.parametrize("nlags", [2, 3])
+def test_miso_lfilter_useic_true_deprecated(nlags, useic):
+    # with two or more AR lags, lfiltic of scipy < 1.16 used True as
+    # y[-1] = 1, with zero for the further lags. That result is kept, with a
+    # warning.
+    _, ma, x = _miso_lfilter_data()
+    ar = array([1.0, -0.5, 0.2, 0.1])[: nlags + 1]
+    with pytest.warns(FutureWarning, match="useic must be False or the initial"):
+        y, inp = miso_lfilter(ar, ma, x, useic=useic)
+    past = [1.0] + [0.0] * (nlags - 1)
+    expected_y, expected_inp = _miso_lfilter_recursion(ar, ma, x, past)
+    assert_allclose(inp, expected_inp, rtol=1e-12)
+    assert_allclose(y, expected_y, rtol=1e-10)
+
+
+@pytest.mark.parametrize("nsides", [1, 2])
+@pytest.mark.parametrize("nvar", [1, 2, 3])
+def test_convolution_filter_row_filter(nvar, nsides):
+    # a (1, nvar) filter has one coefficient per column of x. It was
+    # convolved across the columns instead, which returned one column, 3 * x0
+    # + 2 * x1 = [[23], [46], ...] for nvar = 2. Each column of x is
+    # multiplied by its own coefficient, with no NaN padding for one lag.
+    t = np.arange(1.0, 7.0)
+    x = t[:, None] * np.array([1.0, 10.0, 100.0])[:nvar]
+    filt = np.array([[2.0, 3.0, 4.0][:nvar]])
+    expected = t[:, None] * np.array([2.0, 30.0, 400.0])[:nvar]
+    res = convolution_filter(x, filt, nsides=nsides)
+    assert isinstance(res, np.ndarray)
+    assert_allclose(res, expected, rtol=1e-12)
+    # a DataFrame raised, since the result had one column
+    columns = ["a", "b", "c"][:nvar]
+    index = date_range("2000-01-01", periods=6)
+    res_df = convolution_filter(
+        DataFrame(x, columns=columns, index=index), filt, nsides=nsides
+    )
+    assert isinstance(res_df, DataFrame)
+    assert list(res_df.columns) == columns
+    assert_index_equal(res_df.index, index)
+    assert_allclose(res_df.to_numpy(), expected, rtol=1e-12)
+
+
+CONVOLUTION_FILT_COLUMNS = "filt must have one column, or one column per column"
+
+
+@pytest.mark.parametrize("nsides", [1, 2])
+@pytest.mark.parametrize("case", ["fewer-columns", "one-observation"])
+def test_convolution_filter_row_filter_columns_deprecated(case, nsides):
+    # a filter with one row and more than one column, but not one column per
+    # column of x, is not one coefficient per column. It is still convolved
+    # across the columns of x as before, which warns.
+    t = np.arange(1.0, 7.0)
+    if case == "fewer-columns":
+        # column c of the result is 3 * x[:, c] + 2 * x[:, c + 1]
+        x = t[:, None] * np.array([1.0, 10.0, 100.0])
+        filt = [[2.0, 3.0]]
+        expected = t[:, None] * np.array([23.0, 230.0])
+    else:
+        # the valid part of the convolution of [1, 10] and [2, 3, 4]
+        x = np.array([[1.0, 10.0]])
+        filt = [[2.0, 3.0, 4.0]]
+        expected = np.array([[2.0 * 10 + 3.0 * 1, 3.0 * 10 + 4.0 * 1]])
+    with pytest.warns(FutureWarning, match=CONVOLUTION_FILT_COLUMNS):
+        res = convolution_filter(x, filt, nsides=nsides)
+    assert_allclose(res, expected, rtol=1e-12)
+
+
+@pytest.mark.parametrize("nsides", [1, 2])
+def test_convolution_filter_extra_filter_columns_deprecated(nsides):
+    # a 2-d filter with more columns than x ignored the extra columns. It
+    # warns, and each column of x is still filtered with its column of filt,
+    # as the 1-d filter path filters a 1-d series
+    rng = np.random.default_rng(20261121)
+    # integer data, so that every sum is exact
+    x = rng.integers(-9, 10, size=(25, 2)).astype(float)
+    filt = rng.integers(-5, 6, size=(3, 3)).astype(float)
+    index = date_range("2000-01-01", periods=25)
+    df = DataFrame(x, columns=["a", "b"], index=index)
+    for x_in in (x, df):
+        with pytest.warns(FutureWarning, match=CONVOLUTION_FILT_COLUMNS):
+            res = convolution_filter(x_in, filt, nsides=nsides)
+        assert res.shape == x.shape
+        for i in range(2):
+            expected = convolution_filter(x[:, i], filt[:, i], nsides=nsides)
+            # atol keeps a sum that cancels to zero from failing if scipy
+            # convolves by FFT
+            assert_allclose(np.asarray(res)[:, i], expected, rtol=1e-12, atol=1e-10)
+    assert list(res.columns) == ["a", "b"]
+    assert_index_equal(res.index, index)
+
+
+@pytest.mark.parametrize("nsides", [1, 2])
+@pytest.mark.parametrize(
+    "x_shape, filt_shape",
+    [((25, 3), (3, 2)), ((25, 2), (1, 3))],
+    ids=["fewer-columns", "row-more-columns"],
+)
+def test_convolution_filter_filter_columns_raises(x_shape, filt_shape, nsides):
+    # a filter with more than one row and fewer columns than x raised an
+    # IndexError, and one with one row and more columns than x raised an
+    # unclear ValueError from scipy
+    x = np.ones(x_shape)
+    filt = np.ones(filt_shape)
+    with pytest.raises(ValueError, match=CONVOLUTION_FILT_COLUMNS):
+        convolution_filter(x, filt, nsides=nsides)

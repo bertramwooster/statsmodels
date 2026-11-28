@@ -258,11 +258,13 @@ def test_hdr_plot(close_figures):
 @pytest.mark.thread_unsafe(reason="Uses matplotlib")
 @pytest.mark.matplotlib
 def test_hdr_alpha(close_figures):
+    alpha = [0.7]
     try:
         # Pool() forks, which warns when the process is threaded (platform dependent)
         with warns_or_none(DeprecationWarning, match=r"This process \(pid=\d+\) is"):
-            _, hdr = hdrboxplot(data, alpha=[0.7], rng=12345, kernel_rng=1234567)
+            _, hdr = hdrboxplot(data, alpha=alpha, rng=12345, kernel_rng=1234567)
 
+        assert alpha == [0.7]
         extra_quant_t = np.vstack(
             [
                 [
@@ -383,13 +385,45 @@ def test_hdr_multiple_alpha(close_figures):
 @pytest.mark.slow
 @pytest.mark.thread_unsafe(reason="Uses matplotlib")
 @pytest.mark.matplotlib
+@pytest.mark.parametrize("make_alpha", [list, tuple, np.array])
+def test_hdr_alpha_reused(close_figures, make_alpha):
+    # A reused alpha must not collect the levels of an earlier call, here the
+    # threshold of the first call: the second call returns the extra quantiles
+    # of a call with a fresh alpha.
+    alpha = make_alpha([0.8])
+    kwargs = {"rng": 12345, "kernel_rng": 1234567}
+    try:
+        # Pool() forks, which warns when the process is threaded (platform dependent)
+        with warns_or_none(DeprecationWarning, match=r"This process \(pid=\d+\) is"):
+            hdrboxplot(data, alpha=alpha, threshold=0.93, **kwargs)
+        with warns_or_none(DeprecationWarning, match=r"This process \(pid=\d+\) is"):
+            _, reused = hdrboxplot(data, alpha=alpha, threshold=0.95, **kwargs)
+        with warns_or_none(DeprecationWarning, match=r"This process \(pid=\d+\) is"):
+            _, fresh = hdrboxplot(data, alpha=[0.8], threshold=0.95, **kwargs)
+    except OSError:
+        pytest.xfail("Multiprocess randomly crashes in Windows testing")
+
+    assert list(alpha) == [0.8]
+    assert np.shape(reused.extra_quantiles) == np.shape(fresh.extra_quantiles)
+    assert_allclose(reused.extra_quantiles, fresh.extra_quantiles)
+    assert_equal(reused.outliers_idx, fresh.outliers_idx)
+
+
+@pytest.mark.skipif(
+    PYTHON_IMPL_WASM, reason="Multiprocessing is not supported in WASM/Pyodide"
+)
+@pytest.mark.slow
+@pytest.mark.thread_unsafe(reason="Uses matplotlib")
+@pytest.mark.matplotlib
 def test_hdr_threshold(close_figures):
+    alpha = [0.8]
     try:
         # Pool() forks, which warns when the process is threaded (platform dependent)
         with warns_or_none(DeprecationWarning, match=r"This process \(pid=\d+\) is"):
             _, hdr = hdrboxplot(
-                data, alpha=[0.8], threshold=0.93, rng=12345, kernel_rng=1234567
+                data, alpha=alpha, threshold=0.93, rng=12345, kernel_rng=1234567
             )
+        assert alpha == [0.8]
         labels_pos = np.all(np.isin(data, hdr.outliers).reshape(data.shape), axis=1)
         outliers = labels[labels_pos]
         assert_equal([1968, 1982, 1983, 1997, 1998], outliers)

@@ -14,7 +14,7 @@ from statsmodels.base.wrapper import (
     union_dicts,
 )
 from statsmodels.tools.rng_qrng import check_random_state
-from statsmodels.tools.validation import is_int_like, string_like
+from statsmodels.tools.validation import int_like, is_int_like, string_like
 
 
 class HoltWintersResults(Results):
@@ -232,6 +232,13 @@ class HoltWintersResults(Results):
             The number of out of sample forecasts from the end of the
             sample.
 
+            .. versionchanged:: 0.15.1
+
+               A float with an integral value, such as 3.0, is a number of
+               steps, as an int is, and so is a 0-d integer array with a date
+               index. They raised a KeyError or a TypeError. A bool raises a
+               TypeError: True was one step without a date index.
+
         Returns
         -------
         forecast : ndarray or Series
@@ -239,6 +246,7 @@ class HoltWintersResults(Results):
             past the sample if `endog` is a pandas object, otherwise an
             ndarray.
         """
+        steps = int_like(steps, "steps")
         freq = getattr(self.model._index, "freq", 1)
         if not is_int_like(freq) and isinstance(
             self.model._index, (pd.DatetimeIndex, pd.PeriodIndex)
@@ -534,6 +542,12 @@ class HoltWintersResults(Results):
                        L_t\quad\text{else}
                    \end{cases}
 
+        .. versionchanged:: 0.15.1
+
+           The trend coefficient :math:`\beta` in the simulation equations is
+           ``smoothing_level * smoothing_trend``, as implied by the fitted
+           Holt-Winters recursion. Previously it was ``smoothing_trend``.
+
         References
         ----------
         .. [1] Hyndman, R.J., & Athanasopoulos, G. (2018) *Forecasting:
@@ -699,7 +713,7 @@ class HoltWintersResults(Results):
 
             y[t, :] = y0 + eta * eps[t, :]
             lvl[t, :] = l0 + alpha * (mul_error * l0 + kappa_l) * eps[t, :]
-            b[t, :] = b0 + beta * (mul_error * b0 + kappa_b) * eps[t, :]
+            b[t, :] = b0 + alpha * beta * (mul_error * b0 + kappa_b) * eps[t, :]
             s[t, :] = s0 + gamma * (mul_error * s0 + kappa_s) * eps[t, :]
 
         if use_boxcox:

@@ -41,6 +41,58 @@ class TestDistributions:
         f2 = StepFunction(x, y, side="right")
         npt.assert_almost_equal(f2([1, 2, 3, 4, 5]), [7, 10, 13, 14, 15])
 
+    @pytest.mark.parametrize(
+        "side, expected",
+        [
+            ("left", [3, 3, 3, 10, 10, 20, 20]),
+            ("right", [3, 3, 10, 10, 20, 20, 20]),
+        ],
+    )
+    def test_stepfunction_infinite_boundaries(self, side, expected):
+        f = StepFunction([1, 2], [10, 20], ival=3, side=side)
+        time = np.array([-np.inf, 0, 1, 1.5, 2, 3, np.inf])
+        npt.assert_array_equal(f(time), expected)
+
+    @pytest.mark.parametrize("side", ["left", "right"])
+    def test_stepfunction_negative_infinity_scalar(self, side):
+        f = StepFunction([1, 2], [10, 20], ival=3, side=side)
+        assert f(-np.inf) == 3
+
+    @pytest.mark.parametrize("side", ["left", "right"])
+    def test_ecdf_negative_infinity(self, side):
+        ecdf = ECDF([1, 2], side=side)
+        assert ecdf(-np.inf) == 0
+
+    def test_stepfunction_repeated_negative_infinity(self):
+        x = [-np.inf] * 253 + [1, 2, 3]
+        y = np.arange(len(x))
+        f = StepFunction(x[::-1], y[::-1], ival=3)
+        assert f(-np.inf) == 3
+
+    @pytest.mark.parametrize("side", ["left", "right"])
+    def test_stepfunction_unsorted_ties(self, side):
+        # At a point, the value is the last y, in the order of the input, of
+        # the tied largest x that is not above the point (side="right") or is
+        # below it (side="left"). x includes repeated -inf.
+        rng = np.random.default_rng(11257)
+        nobs = 300
+        x = rng.integers(0, 5, nobs).astype(float)
+        x[::7] = -np.inf
+        y = np.arange(nobs, dtype=float)
+        ival = -1.0
+        time = np.r_[-np.inf, np.arange(-1, 5.5, 0.5), np.inf]
+
+        expected = []
+        for t in time:
+            reached = x <= t if side == "right" else x < t
+            if reached.any():
+                expected.append(y[reached & (x == x[reached].max())][-1])
+            else:
+                expected.append(ival)
+
+        f = StepFunction(x, y, ival=ival, side=side)
+        npt.assert_array_equal(f(time), expected)
+
     def test_monotone_fn_inverter(self):
         x = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
 

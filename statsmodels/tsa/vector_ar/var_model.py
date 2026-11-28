@@ -750,6 +750,8 @@ class VAR(TimeSeriesModel):
         # Set by fit()/_estimate_var(), once the lag order is known
         self.nobs = None
         self.k_trend = None
+        # fit replaces exog_names with the names of all regressors
+        self._orig_exog_names = self.exog_names
 
     def predict(self, params, start=None, end=None, lags=1, trend="c"):
         """
@@ -776,6 +778,24 @@ class VAR(TimeSeriesModel):
         ndarray
             Array of in-sample predicted values and/or out-of-sample
             forecasts.
+
+        Notes
+        -----
+        The deterministic terms are those of ``fit``: the time trend of the
+        zero-indexed observation t is t + 1. Out-of-sample forecasts are not
+        available for a model with exog, since predict has no future values
+        of exog; use ``VARResults.forecast`` instead.
+
+        .. versionchanged:: 0.15.1
+
+           Out-of-sample forecasts work with every trend and with a start
+           after the sample, and in-sample predictions work with exog;
+           these raised errors. Some ranges that end out of sample returned
+           an empty array (``end - start`` twice the number of out-of-sample
+           observations), in-sample predictions with trend "ct" or "ctt"
+           could use a wrong time trend, and a start below lags could
+           return copies of one prediction. Such a start raises a
+           ValueError.
         """
         params = np.array(params)
 
@@ -790,37 +810,45 @@ class VAR(TimeSeriesModel):
             prediction_index,
         ) = self._get_prediction_index(start, end)
 
-        if end < start:
-            raise ValueError("end is before start")
-        if end == start + out_of_sample:
-            return np.array([])
+        if start < lags:
+            raise ValueError(
+                f"start must be at least lags ({lags}), the first observation "
+                f"that has a prediction, got {start}"
+            )
 
         k_trend = util.get_trendorder(trend)
         k = self.neqs
         k_ar = lags
-
-        predictedvalues = np.zeros((end + 1 - start + out_of_sample, k))
-        if k_trend != 0:
-            intercept = params[:k_trend]
-            predictedvalues += intercept
-
         y = self.endog
-        x = util.get_var_endog(y, lags, trend=trend, has_constant="raise")
-        fittedvalues = np.dot(x, params)
+        n_totobs = y.shape[0]
 
-        fv_start = start - k_ar
-        pv_end = min(len(predictedvalues), len(fittedvalues) - fv_start)
-        fv_end = min(len(fittedvalues), end - k_ar + 1)
-        predictedvalues[:pv_end] = fittedvalues[fv_start:fv_end]
+        # The regressors of fit for the observations k_ar, ..., n_totobs - 1:
+        # the trend terms (1, t + 1, (t + 1) ** 2), exog and the lags
+        time = np.arange(k_ar + 1.0, n_totobs + 1)
+        x = np.vander(time, k_trend, increasing=True)
+        if self.exog is not None:
+            x = np.column_stack((x, self.exog[k_ar:]))
+        x = np.column_stack((x, util.get_var_endog(y, k_ar, trend="n")))
+        predictedvalues = np.dot(x, params)[start - k_ar : end - k_ar + 1]
 
         if not out_of_sample:
             return predictedvalues
+        if self.exog is not None:
+            raise ValueError(
+                "predict cannot forecast out of sample with exog. Use the "
+                "forecast method of the results with exog_future."
+            )
 
-        # fit out of sample
-        y = y[-k_ar:]
+        # Forecasts of the observations n_totobs, ..., end + out_of_sample, with
+        # the trend terms built as in VARProcess.forecast
+        time = np.arange(n_totobs + 1.0, n_totobs + 1 + out_of_sample)
+        exog_future = np.vander(time, k_trend, increasing=True)
         coefs = params[k_trend:].reshape((k_ar, k, k)).swapaxes(1, 2)
-        predictedvalues[pv_end:] = forecast(y, coefs, intercept, out_of_sample)
-        return predictedvalues
+        forecasts = forecast(
+            y[-k_ar:], coefs, params[:k_trend], out_of_sample, exog_future
+        )
+        # A start after the sample skips the first forecasts
+        return np.vstack((predictedvalues, forecasts[max(start - n_totobs, 0) :]))
 
     def fit(
         self,
@@ -849,6 +877,12 @@ class VAR(TimeSeriesModel):
             select_order.
         method : {'ols'}, optional
             Estimation method to use
+
+            .. deprecated:: 0.15.1
+
+               Other values were ignored and the model was estimated by OLS.
+               They issue a FutureWarning and will raise a ValueError after
+               statsmodels 0.17 is released.
         ic : {'aic', 'fpe', 'hqic', 'bic', None}, optional
             Information criterion to use for VAR order selection.
             aic : Akaike
@@ -882,11 +916,28 @@ class VAR(TimeSeriesModel):
         Notes
         -----
         See Lütkepohl pp. 146-153 for implementation details.
+
+        .. versionchanged:: 0.15.1
+
+           Fitting a model with exog more than once gives the names of the
+           first fit. Each fit added the regressor names again, which made
+           the model's ``exog_names`` wrong and pandas results raise an
+           error.
         """
         lags = maxlags
         trend = string_like(
             trend, "trend", options=("c", "ct", "ctt", "n"), lower=False
         )
+        if method is not None and not (
+            isinstance(method, str) and method.lower() == "ols"
+        ):
+            warnings.warn(
+                f'method={method!r} is ignored and the model is estimated by '
+                'OLS. Values other than "ols" are deprecated and will raise a '
+                "ValueError after statsmodels 0.17 is released.",
+                FutureWarning,
+                stacklevel=2,
+            )
         if maxlags is not None:
             if maxlags < 0:
                 raise ValueError(f"maxlags must be non-negative, got {maxlags}")
@@ -917,7 +968,7 @@ class VAR(TimeSeriesModel):
             lags = 1
 
         k_trend = util.get_trendorder(trend)
-        orig_exog_names = self.exog_names
+        orig_exog_names = self._orig_exog_names
         self.exog_names = util.make_lag_names(self.endog_names, lags, k_trend)
         self.nobs = self.n_totobs - lags
 
@@ -2901,7 +2952,11 @@ class FEVD:
         Matrix such that Sigma_u = PP', used to orthogonalize the impulse
         responses. Defaults to the Cholesky decomposition of Sigma_u.
     periods : int, optional
-        Number of periods to compute the FEVD for.
+        Number of periods to compute the FEVD for. The default is 10.
+
+        .. versionchanged:: 0.15.1
+
+           None gives the default. It raised a TypeError.
 
     Attributes
     ----------
@@ -2918,13 +2973,21 @@ class FEVD:
     """
 
     def __init__(self, model, P=None, periods=None):
+        if periods is None:
+            periods = 10
         self.periods = periods
 
         self.model = model
         self.neqs = model.neqs
         self.names = model.model.endog_names
 
-        self.irfobj = model.irf(var_decomp=P, periods=periods)
+        self.decomp = self._decompose(P)
+
+    def _decompose(self, P):
+        # The decomposition by the orthogonalized shocks, which sets irfobj.
+        # The FEVD of the structural shocks of an SVAR overrides it.
+        periods = self.periods
+        self.irfobj = self.model.irf(var_decomp=P, periods=periods)
         self.orth_irfs = self.irfobj.orth_irfs
 
         # cumulative impulse responses
@@ -2940,7 +3003,7 @@ class FEVD:
             fevd[i] = (irfs[i].T / mse[i]).T
 
         # switch to equation x lag x component
-        self.decomp = fevd.swapaxes(0, 1)
+        return fevd.swapaxes(0, 1)
 
     def summary(self):
         """
@@ -2970,7 +3033,13 @@ class FEVD:
         Parameters
         ----------
         periods : int, optional
-            Defaults to number originally specified. Can be at most that number
+            Defaults to number originally specified. Can be at most that number.
+            The first periods horizons are plotted.
+
+            .. versionchanged:: 0.15.1
+
+               A smaller number plots the first periods horizons. It raised
+               a ValueError. 0 raises a ValueError. It plotted all horizons.
         figsize : tuple of float, optional
             Figure size (width, height in inches), passed to
             `matplotlib.pyplot.subplots`. The default is (10, 10).
@@ -2985,7 +3054,13 @@ class FEVD:
         plt = _import_mpl()
 
         k = self.neqs
-        periods = periods or self.periods
+        if periods is None:
+            periods = self.periods
+        periods = int_like(periods, "periods")
+        if not 1 <= periods <= self.periods:
+            raise ValueError(
+                f"periods must be between 1 and {self.periods}, got {periods}"
+            )
 
         fig, axes = plt.subplots(nrows=k, figsize=figsize)
 
@@ -2994,7 +3069,7 @@ class FEVD:
         colors = [str(c) for c in np.arange(k, dtype=float) / k]
         ticks = np.arange(periods)
 
-        limits = self.decomp.cumsum(2)
+        limits = self.decomp[:, :periods].cumsum(2)
         ax = axes[0]
         for i in range(k):
             ax = axes[i]

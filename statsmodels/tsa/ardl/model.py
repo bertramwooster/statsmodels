@@ -230,6 +230,11 @@ class ARDL(AutoReg):
         list of lag indices to include.  For example, [1, 4] will only
         include lags 1 and 4 while lags=4 will include lags 1, 2, 3, and 4.
         None excludes all AR lags, and behaves identically to 0.
+
+        .. versionchanged:: 0.15.1
+
+           A 0-d array that holds an integer is a number of lags, as an int
+           is. It raised a TypeError.
     exog : array_like, optional
         Exogenous variables to include in the model. Either a DataFrame or
         an 2-d array-like structure that can be converted to a NumPy array.
@@ -689,7 +694,9 @@ class ARDL(AutoReg):
 
         def pad_x(x: np.ndarray, pad: int) -> np.ndarray:
             if pad == 0:
-                return x
+                # Copy: dynamic forecasts are written into the returned array
+                # and x is a view of self._x
+                return x.copy()
             k = x.shape[1]
             return np.vstack([np.full((pad, k), np.nan), x])
 
@@ -2073,8 +2080,9 @@ class UECM(ARDL):
 
         .. versionchanged:: 0.15.1
 
-            A float with an integral value, such as 2.0, is accepted as an
-            int is. It raised a TypeError.
+            A float with an integral value, such as 2.0, and a 0-d array that
+            holds an integer are accepted as an int is. They raised a
+            TypeError.
     exog : array_like, optional
         Exogenous variables to include in the model. Either a DataFrame or
         an 2-d array-like structure that can be converted to a NumPy array.

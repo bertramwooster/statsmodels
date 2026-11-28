@@ -17,7 +17,7 @@ import numpy as np
 from numpy.testing import assert_allclose, assert_almost_equal, assert_equal
 import pandas as pd
 import pytest
-from scipy import stats
+from scipy import linalg, stats
 
 from statsmodels.datasets import macrodata
 import statsmodels.tools.data as data_util
@@ -1445,6 +1445,61 @@ def test_irf_err_band_component_max_last_row(method):
     assert not np.allclose(ones.lower[1:, 2, 0], zeros.lower[1:, 2, 0])
 
 
+@pytest.mark.parametrize("orth", [False, True])
+@pytest.mark.parametrize("method", ["err_band_sz1", "err_band_sz2", "err_band_sz3"])
+def test_irf_err_band_sims_zha_documented(method, orth):
+    # The bands as described in the Notes of the err_band_sz* docstrings,
+    # computed from the simulated responses of irf_resim
+    data = get_macrodata().view((float, 3), type=np.ndarray)
+    res = VAR(data).fit(2)
+    periods, repl, signif = 4, 60, 0.1
+    irf = res.irf(periods)
+    irfs = irf.orth_irfs if orth else irf.irfs
+    sims = res.irf_resim(orth=orth, repl=repl, steps=periods, rng=np.random.default_rng(3))
+    band = getattr(irf, method)(
+        orth=orth, repl=repl, signif=signif, rng=np.random.default_rng(3)
+    )
+    # The round(signif / 2 * repl)-th and round((1 - signif / 2) * repl)-th
+    # smallest values: the 3rd and the 57th
+    lo, hi = 2, 56
+
+    def eig(values):
+        # The eigenvectors (columns) of the covariance of the simulated values
+        eigvals, eigvecs = linalg.eig(
+            np.cov(values, rowvar=False), left=True, right=False
+        )
+        return eigvals.real, eigvecs.real, int(np.argmax(eigvals.real))
+
+    expected_lower = irfs.copy()
+    expected_upper = irfs.copy()
+    for j in range(3):
+        if method == "err_band_sz3":
+            # The responses of all variables to shock j, variable by variable
+            _, w, k = eig(np.concatenate([sims[:, 1:, i, j] for i in range(3)], 1))
+        for i in range(3):
+            c = sims[:, 1:, i, j]
+            if method == "err_band_sz1":
+                lam, w, k = eig(c)
+                dev = stats.norm.ppf(1 - signif / 2) * np.sqrt(lam[k]) * w[:, k]
+                expected_lower[1:, i, j] += dev
+                expected_upper[1:, i, j] -= dev
+                continue
+            if method == "err_band_sz2":
+                _, w, k = eig(c)
+                row = w[k]
+            else:
+                row = w[k, i * periods : (i + 1) * periods]
+            g = np.sort(row * c, axis=0)
+            expected_lower[1:, i, j] += g[lo]
+            expected_upper[1:, i, j] += g[hi]
+    assert_allclose(band.lower, expected_lower, rtol=1e-10)
+    assert_allclose(band.upper, expected_upper, rtol=1e-10)
+    if method != "err_band_sz1":
+        # The bands need not contain the point estimate
+        inside = (band.lower[1:] <= irfs[1:]) & (irfs[1:] <= band.upper[1:])
+        assert not np.all(inside)
+
+
 @pytest.mark.thread_unsafe(reason="uses matplotlib")
 @pytest.mark.matplotlib
 @pytest.mark.parametrize("method", ["plot", "plot_cum_effects"])
@@ -2559,6 +2614,253 @@ def test_causality_bool_float(value, call):
             res.test_causality([value])
         else:
             res.test_inst_causality(value)
+
+
+@pytest.mark.parametrize("use_pandas", [False, True])
+@pytest.mark.parametrize("trend", ["c", "ct"])
+def test_var_refit_exog_names(use_pandas, trend):
+    # Each fit of a model with exog uses the original exog names
+    names = ["realgdp", "realcons", "realinv"]
+    data = macrodata.load_pandas().data[names]
+    y = np.diff(np.log(data.to_numpy()), axis=0)
+    exog = np.random.default_rng(7).standard_normal((y.shape[0], 1))
+    if use_pandas:
+        y = pd.DataFrame(y, columns=names)
+        exog = pd.DataFrame(exog, columns=["x"])
+        endog_names, exog_name = names, "x"
+    else:
+        endog_names, exog_name = ["y1", "y2", "y3"], "x1"
+    mod = VAR(y, exog=exog)
+    trend_names = ["const", "trend"][: len(trend)]
+    for lags in (1, 2, 2, 1):
+        res = mod.fit(lags, trend=trend)
+        lag_names = [f"L{i}.{name}" for i in range(1, lags + 1) for name in endog_names]
+        expected = trend_names + [exog_name] + lag_names
+        assert mod.exog_names == expected
+        assert list(mod.data.cov_names) == [
+            (xname, yname) for xname in expected for yname in endog_names
+        ]
+        fresh = VAR(y, exog=exog).fit(lags, trend=trend)
+        assert_allclose(np.asarray(res.params), np.asarray(fresh.params), rtol=1e-12)
+        if use_pandas:
+            assert list(res.params.index) == expected
+            assert list(res.cov_params().index.get_level_values(0)) == [
+                name for name in expected for _ in range(3)
+            ]
+
+
+def _var_predict_written_out(y, params, lags, k_trend, start, end, exog=None):
+    # Predictions of the zero-indexed observations start, ..., end:
+    # y_t = B_d' d_t + B_x' x_t + sum_i B_i' y_{t-i} with the trend terms
+    # d_t = (1, t + 1, (t + 1) ** 2)[:k_trend] and exog x_t, using the data
+    # in the sample and the forecasts after it
+    k = y.shape[1]
+    k_det = k_trend + (0 if exog is None else exog.shape[1])
+    path = list(y)
+    predictions = []
+    for t in range(lags, end + 1):
+        value = np.array([1.0, t + 1.0, (t + 1.0) ** 2])[:k_trend] @ params[:k_trend]
+        if exog is not None:
+            value = value + exog[t] @ params[k_trend:k_det]
+        for i in range(1, lags + 1):
+            value = value + path[t - i] @ params[k_det + (i - 1) * k : k_det + i * k]
+        if t >= y.shape[0]:
+            path.append(value)
+        predictions.append(value)
+    return np.array(predictions[start - lags :])
+
+
+def _var_predict_data():
+    data = macrodata.load_pandas().data[["realgdp", "realcons", "realinv"]]
+    return np.diff(np.log(data.to_numpy()), axis=0)
+
+
+@pytest.mark.parametrize("trend", ["n", "c", "ct", "ctt"])
+@pytest.mark.parametrize("lags", [1, 2])
+@pytest.mark.parametrize(
+    "start, end, from_n",
+    [
+        (-3, 3, True),  # in and out of sample
+        (-3, 1, True),  # end - start twice the out-of-sample length gave []
+        (1, 3, True),  # start after the sample
+        (0, 0, True),  # only the first forecast
+        (10, 11, False),  # in sample, as many rows as "ct" has trend terms
+        (None, None, False),  # all in-sample predictions
+    ],
+)
+def test_var_predict_trend_out_of_sample(trend, lags, start, end, from_n):
+    y = _var_predict_data()
+    n = y.shape[0]
+    if from_n:
+        # start and end count from n, the number of observations
+        start, end = n + start, n + end
+    mod = VAR(y)
+    res = mod.fit(lags, trend=trend)
+    params = np.asarray(res.params)
+    pred = mod.predict(params, start=start, end=end, lags=lags, trend=trend)
+    first = lags if start is None else start
+    last = n - 1 if end is None else end
+    expected = _var_predict_written_out(y, params, lags, res.k_trend, first, last)
+    assert pred.shape == (last - first + 1, 3)
+    assert_allclose(pred, expected, rtol=1e-8)
+
+
+@pytest.mark.parametrize(
+    "trend, expected",
+    [
+        # R vars 1.6.1 (R 4.6.2), y the log differences of realgdp,
+        # realcons and realinv of macrodata, n = 202:
+        # tt2 <- matrix((1:n)^2, ncol = 1, dimnames = list(NULL, "tt2"))
+        # est <- VAR(y, p = 2, type = "both", exogen = tt2)
+        # fut <- matrix((n + 1:3)^2, ncol = 1, dimnames = list(NULL, "tt2"))
+        # predict(est, n.ahead = 3, dumvar = fut)
+        (
+            "ctt",
+            [
+                [0.0037595019294891351, 0.0039060752482694737, -0.00054302873264010232],
+                [0.0038690994873518459, 0.0059887554230986474, -0.014483391087102813],
+                [0.0038982522979758593, 0.0052554488093068032, -0.0098882455177141532],
+            ],
+        ),
+        # predict(VAR(y, p = 2, type = "none"), n.ahead = 3)
+        (
+            "n",
+            [
+                [0.0042356792144035028, 0.0025459148324905199, 0.017484669325280769],
+                [0.0036601381578146145, 0.0039065028527603849, 0.004524250872569008],
+                [0.0028099951813873075, 0.0027067133561361513, 0.0062816370863210888],
+            ],
+        ),
+    ],
+)
+def test_var_predict_out_of_sample_r(trend, expected):
+    y = _var_predict_data()
+    n = y.shape[0]
+    mod = VAR(y)
+    res = mod.fit(2, trend=trend)
+    pred = mod.predict(res.params, start=n, end=n + 2, lags=2, trend=trend)
+    assert_allclose(pred, expected, rtol=1e-7)
+
+
+@pytest.mark.parametrize("trend", ["n", "c", "ct"])
+def test_var_predict_exog(trend):
+    y = _var_predict_data()
+    n = y.shape[0]
+    exog = np.random.default_rng(1122).standard_normal((n, 2))
+    mod = VAR(y, exog=exog)
+    res = mod.fit(2, trend=trend)
+    params = np.asarray(res.params)
+    pred = mod.predict(params, start=5, end=n - 1, lags=2, trend=trend)
+    expected = _var_predict_written_out(y, params, 2, res.k_trend, 5, n - 1, exog)
+    assert_allclose(pred, expected, rtol=1e-8)
+    with pytest.raises(ValueError, match="cannot forecast out of sample with exog"):
+        mod.predict(params, start=n - 1, end=n + 1, lags=2, trend=trend)
+
+
+def test_var_predict_start_before_lags():
+    y = _var_predict_data()
+    n = y.shape[0]
+    mod = VAR(y)
+    for lags in (1, 2):
+        params = mod.fit(lags).params
+        # start=0 and end=n-1 with one lag returned n copies of a fitted value
+        with pytest.raises(ValueError, match="start must be at least lags"):
+            mod.predict(params, start=lags - 1, end=n - 1, lags=lags)
+
+
+@pytest.mark.parametrize("centered", [False, True])
+def test_seasonal_dummies_negative_raises(centered):
+    with pytest.raises(ValueError, match="n_seasons must be non-negative"):
+        util.seasonal_dummies(-1, 5, centered=centered)
+    # Observations in the seasons 1, 2, 3, 0, 1, 2 of 4; one column for each
+    # of the seasons 0, 1, 2
+    expected = np.zeros((6, 3))
+    expected[[3, 0, 1, 4, 5], [0, 1, 2, 1, 2]] = 1
+    if centered:
+        expected -= 1 / 4
+    actual = util.seasonal_dummies(4, 6, first_period=1, centered=centered)
+    assert_allclose(actual, expected, rtol=1e-14)
+
+
+@pytest.mark.parametrize("method", ["mle", "gls", 1])
+def test_var_fit_method_deprecated(method):
+    # Only "ols" is implemented, other values were ignored; "ols" in any
+    # case and None (the default) do not warn
+    data = macrodata.load_pandas().data[["realgdp", "realcons", "realinv"]]
+    y = np.diff(np.log(data.to_numpy()), axis=0)
+    with pytest.warns(FutureWarning, match="is ignored and the model is estimated"):
+        res = VAR(y).fit(2, method=method)
+    z = np.column_stack([np.ones(y.shape[0] - 2), y[1:-1], y[:-2]])
+    ols = np.linalg.lstsq(z, y[2:], rcond=None)[0]
+    assert_allclose(res.params, ols, rtol=1e-10)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        for quiet in ("ols", "OLS", None):
+            res = VAR(y).fit(2, method=quiet)
+            assert_allclose(res.params, ols, rtol=1e-10)
+
+
+def _fevd_written_out(res, periods):
+    # decomp[j, h - 1, k] = sum_{i<h} Theta_i[j, k] ** 2 / MSE_h[j, j] with
+    # Theta_i = Phi_i P, P the Cholesky factor of Sigma_u and the MA weights
+    # Phi_0 = I, Phi_i = sum_{l=1}^{min(i, p)} Phi_{i-l} A_l
+    k, p = res.neqs, res.k_ar
+    phis = [np.eye(k)]
+    for i in range(1, periods):
+        lags = range(1, min(i, p) + 1)
+        phis.append(sum(phis[i - lag] @ res.coefs[lag - 1] for lag in lags))
+    thetas = np.array([phi @ np.linalg.cholesky(res.sigma_u) for phi in phis])
+    num = np.cumsum(thetas**2, axis=0)
+    return (num / num.sum(2, keepdims=True)).swapaxes(0, 1)
+
+
+def test_fevd_default_periods():
+    data = macrodata.load_pandas().data[["realgdp", "realcons", "realinv"]]
+    y = np.diff(np.log(data.to_numpy()), axis=0)
+    res = VAR(y).fit(2)
+    expected = _fevd_written_out(res, 10)
+    for fevd in (var_model.FEVD(res), res.fevd(None)):
+        assert fevd.periods == 10
+        assert_allclose(fevd.decomp, expected, rtol=1e-10)
+
+
+@pytest.mark.matplotlib
+@pytest.mark.parametrize("periods", [4, 10, None])
+def test_fevd_plot_periods(periods, close_figures):
+    # The bars of variable i stack the shares of the shocks for the first
+    # periods horizons
+    data = macrodata.load_pandas().data[["realgdp", "realcons", "realinv"]]
+    y = np.diff(np.log(data.to_numpy()), axis=0)
+    res = VAR(y).fit(2)
+    fig = res.fevd(10).plot(periods=periods)
+    n_periods = 10 if periods is None else periods
+    expected = _fevd_written_out(res, n_periods)
+    assert len(fig.axes) == 3
+    for i, ax in enumerate(fig.axes):
+        assert len(ax.patches) == 3 * n_periods
+        heights = np.array([p.get_height() for p in ax.patches])
+        bottoms = np.array([p.get_y() for p in ax.patches])
+        centers = np.array([p.get_x() + p.get_width() / 2 for p in ax.patches])
+        shares = expected[i].T
+        assert_allclose(heights.reshape(3, n_periods), shares, rtol=1e-10)
+        stacked = np.vstack([np.zeros(n_periods), np.cumsum(shares, axis=0)[:-1]])
+        assert_allclose(bottoms.reshape(3, n_periods), stacked, rtol=1e-10)
+        # The centers are x - width / 2 + width / 2, exact up to the rounding
+        # of width = 0.8, which atol allows for at the center 0
+        ticks = np.tile(np.arange(n_periods), (3, 1))
+        assert_allclose(centers.reshape(3, n_periods), ticks, rtol=0, atol=1e-12)
+
+
+@pytest.mark.matplotlib
+def test_fevd_plot_periods_invalid(close_figures):
+    data = macrodata.load_pandas().data[["realgdp", "realcons", "realinv"]]
+    y = np.diff(np.log(data.to_numpy()), axis=0)
+    fevd = VAR(y).fit(2).fevd(5)
+    for periods in (6, 0, -1):
+        with pytest.raises(ValueError, match="periods must be between 1 and 5"):
+            fevd.plot(periods=periods)
+    with pytest.raises(TypeError, match="periods must be integer_like"):
+        fevd.plot(periods=2.5)
 
 
 @pytest.fixture
